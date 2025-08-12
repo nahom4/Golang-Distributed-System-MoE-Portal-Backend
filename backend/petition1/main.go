@@ -5,41 +5,47 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	config "petition2/config"
 	"sync"
 	"time"
 
+	"petition1/config"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gorm.io/gorm"
 )
 
+// API DTOs (transport-layer structs)
+type User struct {
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Email     string `json:"email"`
+}
+
+type TextDocument struct {
+	Title   string `json:"title"`
+	Text    string `json:"text"`
+	OwnerId int    `json:"owner_id"`
+}
+
+type SignPetitionDTO struct {
+    UserId       uint   `json:"UserId" binding:"required"`
+    PetitionName string `json:"PetitionName" binding:"required"`
+}
+
+// In-memory live-edit cache (not the DB)
 var (
-	docMutex sync.Mutex
+	cacheMu sync.RWMutex
+	cache   = make(map[string]TextDocument)
 )
-var cache = make(map[string]TextDocument)
+
+// WebSocket hub
 
 type Client struct {
 	hub      *Hub
 	conn     *websocket.Conn
 	Send     chan *TextDocument
 	Document TextDocument
-}
-
-type User struct {
-	FirstName string
-	LastName  string
-	Email     string
-}
-
-type TextDocument struct {
-	Title        string
-	Text         string
-	OwnerId      int
-}
-
-type SignPetition struct {
-	UserId     int
-	PetitionName string
 }
 
 type Hub struct {
@@ -63,15 +69,20 @@ func (h *Hub) run() {
 		select {
 		case client := <-h.register:
 			h.clients[client] = true
+
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.Send)
 			}
+
 		case doc := <-h.broadcast:
+			cacheMu.Lock()
 			cache[doc.Title] = *doc
+			cacheMu.Unlock()
+
 			for client := range h.clients {
-				client.Document.Text = string(doc.Text)
+				client.Document.Text = doc.Text
 				select {
 				case client.Send <- &client.Document:
 				default:
@@ -89,59 +100,139 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-func saveDocument(document TextDocument) (TextDocument,error) {
+// Data access helpers (GORM over in-memory SQLite)
 
-
+func saveDocument(document TextDocument) (TextDocument, error) {
 	if document.Title == "" {
-		return document,errors.New("title must not be empty")
+		return document, errors.New("title must not be empty")
+	}
+	rec := database.Petition{
+		Name:    document.Title,
+		Text:    document.Text,
+		OwnerId: document.OwnerId,
+	}
+	if err := database.DB.Create(&rec).Error; err != nil {
+		return document, err
+	}
+	return document, nil
+}
+
+func getDocument(documentName string) (TextDocument, error) {
+	var p database.Petition
+	err := database.DB.
+		Where("name = ?", documentName).
+		Order("petition_id DESC").
+		First(&p).Error
+	if err != nil {
+		return TextDocument{}, err
+	}
+	return TextDocument{
+		Title:   p.Name,
+		Text:    p.Text,
+		OwnerId: p.OwnerId,
+	}, nil
+}
+
+func getAll() ([]TextDocument, error) {
+	// Subquery to get the latest PetitionID per Name
+	sub := database.DB.Model(&database.Petition{}).
+		Select("MAX(petition_id)").
+		Group("name")
+
+	var rows []database.Petition
+	if err := database.DB.
+		Where("petition_id IN (?)", sub).
+		Find(&rows).Error; err != nil {
+		return nil, err
 	}
 
-	query := `INSERT INTO Petition(Name, text, OwnerId)
-	 VALUES (?, ?, ?)`
-	_, err := config.Db.Exec(query, document.Title, document.Text, document.OwnerId)
-
-	return document,err
+	out := make([]TextDocument, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, TextDocument{
+			Title:   r.Name,
+			Text:    r.Text,
+			OwnerId: r.OwnerId,
+		})
+	}
+	return out, nil
 }
-func getDocument(documentName string) (TextDocument,error) {
 
-	var (
-		Name         string
-		text         string
-		OwnerId      int
-	)
+func addSignature(petitionName string, userId uint) error {
+	// Optionally ensure petition exists
 
-	err := config.Db.QueryRow(`SELECT Name,text,OwnerId 
-	FROM Petition where Name = ? ORDER BY PetitionId DESC LIMIT 1`, documentName).Scan(&Name, &text, &OwnerId)
-	docMutex.Lock()
-	doc := TextDocument{
-		Title:        Name,
-		Text:         text,
-		OwnerId:      OwnerId,
+	var count int64
+	if err := database.DB.Model(&database.Petition{}).
+		Where("name = ?", petitionName).
+		Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("petition does not exist")
 	}
 
-	docMutex.Unlock()
-
-	return doc,err
-
+	// Upsert-like behavior: composite primary key prevents duplicates
+	sp := database.SignPetition{
+		PetitionName: petitionName,
+		UserId:       userId,
+	}
+	if err := database.DB.Create(&sp).Error; err != nil {
+		// If duplicate, surface a friendly error
+		return errors.New("user already signed this petition or insert failed")
+	}
+	return nil
 }
+
+func listSignatories(petitionName string) ([]User, error) {
+	// Join users with sign_petitions on user_id
+	var out []User
+	err := database.DB.
+		Table("users").
+		Select("users.first_name, users.last_name, users.email").
+		Joins("JOIN sign_petitions ON sign_petitions.user_id = users.user_id").
+		Where("sign_petitions.petition_name = ?", petitionName).
+		Scan(&out).Error
+	return out, err
+}
+
+// WebSocket handlers
 
 func handleConnections(hub *Hub, c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("upgrade error:", err)
 		return
 	}
-	
-	var doc TextDocument
-	documentName := c.Request.URL.Query().Get("document")
-	if document, ok := cache[documentName]; ok {
-		doc = document
-	} else {
-		doc,_ = getDocument(documentName)
-		cache[documentName] = doc
+
+	documentName := c.Query("document")
+	if documentName == "" {
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("missing ?document=Title query parameter"))
+		_ = conn.Close()
+		return
 	}
-	
-	client := &Client{hub: hub, conn: conn, Send: make(chan *TextDocument), Document: doc}
+
+	// Load doc from cache or DB; if not found, start new empty doc
+	var doc TextDocument
+	cacheMu.RLock()
+	cached, ok := cache[documentName]
+	cacheMu.RUnlock()
+
+	if ok {
+		doc = cached
+	} else {
+		if existing, err := getDocument(documentName); err == nil {
+			doc = existing
+		} else if errors.Is(err, gorm.ErrRecordNotFound) {
+			doc = TextDocument{Title: documentName, Text: "", OwnerId: 0}
+		} else if err != nil {
+			log.Println("getDocument error:", err)
+			doc = TextDocument{Title: documentName, Text: "", OwnerId: 0}
+		}
+		cacheMu.Lock()
+		cache[documentName] = doc
+		cacheMu.Unlock()
+	}
+
+	client := &Client{hub: hub, conn: conn, Send: make(chan *TextDocument, 8), Document: doc}
 	hub.register <- client
 
 	go client.write()
@@ -151,168 +242,155 @@ func handleConnections(hub *Hub, c *gin.Context) {
 
 func (c *Client) read() {
 	defer func() {
-
+		// When the last client disconnects, persist the latest version in cache
 		if len(c.hub.clients) == 1 {
-			saveDocument(cache[c.Document.Title])
+			cacheMu.RLock()
+			latest := cache[c.Document.Title]
+			cacheMu.RUnlock()
+			if _, err := saveDocument(latest); err != nil {
+				log.Println("save on last disconnect error:", err)
+			}
 		}
 		c.hub.unregister <- c
-		c.conn.Close()
+		_ = c.conn.Close()
 	}()
 
 	for {
 		_, message, err := c.conn.ReadMessage()
-		c.Document.Text = string(message)
 		if err != nil {
 			break
 		}
-
+		c.Document.Text = string(message)
 		c.hub.broadcast <- &c.Document
 	}
 }
 
 func (c *Client) write() {
 	defer c.conn.Close()
-	for{
+	for {
 		select {
 		case doc, ok := <-c.Send:
 			if !ok {
 				return
 			}
 			c.Document.Text = doc.Text
-			c.conn.WriteMessage(websocket.TextMessage, []byte(doc.Text))
+			if err := c.conn.WriteMessage(websocket.TextMessage, []byte(doc.Text)); err != nil {
+				return
+			}
 		}
 	}
 }
-func getAll()( []TextDocument,error) {
 
-	query := `SELECT Name, Text, OwnerId
-	FROM Petition
-	WHERE (PetitionId, Name) IN 
-		(SELECT MAX(PetitionId), Name
-		 FROM Petition
-		 GROUP BY Name);
-	`
-	rows, err := config.Db.Query(query)
-	
-	defer rows.Close()
+// HTTP handlers
 
-	var res []TextDocument = make([]TextDocument, 0)
-	for rows.Next() {
-		var name string
-		var OwnerId int
-		var Text string
-		if err := rows.Scan(&name, &Text, &OwnerId); err != nil {
-			continue
-		}
-
-		res = append(res, TextDocument{Title: name, OwnerId: OwnerId, Text: Text})
-	}
-
-	return res,err
-
-}
-
-func getAllPetitions(c *gin.Context) {
-	petitions,err := getAll()
-	if (err != nil){
-		c.IndentedJSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve petitions"})
+func getAllPetitions(ctx *gin.Context) {
+	petitions, err := getAll()
+	if err != nil {
+		ctx.IndentedJSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve petitions"})
 		return
-	}else{
-
-		c.IndentedJSON(http.StatusOK, petitions)
 	}
+	ctx.IndentedJSON(http.StatusOK, petitions)
 }
 
-func createPetition(c *gin.Context) {
+func createPetition(ctx *gin.Context) {
 	var document TextDocument
-	if err := c.BindJSON(&document); err != nil {
+	if err := ctx.BindJSON(&document); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 		return
 	}
-	_,err := getDocument(document.Title)
-	if (err == nil){
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create petition"})
+	if document.Title == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Title must not be empty"})
 		return
 	}
 
-	doc,err := saveDocument(document)
+	// If exists, conflict
+	if _, err := getDocument(document.Title); err == nil {
+		ctx.JSON(http.StatusConflict, gin.H{"error": "Petition already exists"})
+		return
+	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check petition existence"})
+		return
+	}
 
+	doc, err := saveDocument(document)
 	if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create petition"})
-        return
-    }
-    c.JSON(http.StatusOK, gin.H{"message": "Petition created successfully", "petition": doc})
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create petition"})
+		return
+	}
 
+	cacheMu.Lock()
+	cache[doc.Title] = doc
+	cacheMu.Unlock()
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "Petition created successfully", "petition": doc})
 }
 
-func signPetition(c *gin.Context) {
-	var signPetition SignPetition
-	if err := c.BindJSON(&signPetition); err != nil {
+func signPetition(ctx *gin.Context) {
+	var sp SignPetitionDTO
+	if err := ctx.BindJSON(&sp); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+		return
+	}
+	if sp.PetitionName == "" || sp.UserId == 0 {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "PetitionName and UserId are required"})
 		return
 	}
 
-	query := "INSERT INTO SignPetition(PetitionName,UserId) VALUES (?, ?)"
-	_, err := config.Db.Exec(query, signPetition.PetitionName, signPetition.UserId)
-
-	if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign petition"})
-        return
-    }
-
-    c.JSON(http.StatusOK, gin.H{"message": "Petition signed successfully", "signPetition": signPetition})
-}
-
-func getSignatories(c *gin.Context) {
-	petitionName := c.Query("PetitionName")
-	query := `SELECT first_name, last_name, email FROM Users JOIN SignPetition ON Users.id = SignPetition.UserId WHERE SignPetition.PetitionName = ` + petitionName + " "
-	rows, err := config.Db.Query(query)
-	if (err != nil){
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve signatories"})
-		return 
+	if err := addSignature(sp.PetitionName, sp.UserId); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
-	defer rows.Close()
-	var users = make([]User, 0)
-	for rows.Next() {
-		var user = User{}
-		err := rows.Scan(&user.FirstName, &user.LastName, &user.Email)
-		if err != nil {
-			log.Print(err)
+	ctx.JSON(http.StatusOK, gin.H{"message": "Petition signed successfully", "signPetition": sp})
+}
+
+func getSignatories(ctx *gin.Context) {
+	petitionName := ctx.Query("PetitionName")
+	if petitionName == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "PetitionName is required"})
+		return
+	}
+
+	users, err := listSignatories(petitionName)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve signatories"})
+		return
+	}
+	ctx.IndentedJSON(http.StatusOK, users)
+}
+
+// Periodic save of live-edit cache into the DB
+func periodicSave(cache map[string]TextDocument) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cacheMu.RLock()
+		snapshot := make([]TextDocument, 0, len(cache))
+		for _, value := range cache {
+			snapshot = append(snapshot, value)
 		}
-		users = append(users, user)
+		cacheMu.RUnlock()
 
+		for _, value := range snapshot {
+			if _, err := saveDocument(value); err != nil {
+				fmt.Printf("Error saving document %s: %v\n", value.Title, err)
+			}
+		}
 	}
-	c.IndentedJSON(http.StatusOK, users)
 }
-
-func save(cache map[string]TextDocument) {
-    ticker := time.NewTicker(10 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            saveCache(cache)
-        }
-    }
-}
-
-func saveCache(cache map[string]TextDocument) {
-    for title, value := range cache {
-        
-        _,err := saveDocument(value)
-        if err != nil {
-            fmt.Printf("Error saving document %s: %v\n", title, err)
-        }
-    }
-}
-
 
 func main() {
+	// Initialize in-memory DB
+	database.ConnectDB()
+
+	// Start WebSocket hub and periodic saver
 	hub := newHub()
 	go hub.run()
-	go save(cache)
-	router := gin.Default()
+	go periodicSave(cache)
 
+	// Router
+	router := gin.Default()
 	router.GET("/ws", func(c *gin.Context) {
 		handleConnections(hub, c)
 	})
@@ -320,7 +398,9 @@ func main() {
 	router.POST("/createPetition", createPetition)
 	router.POST("/signPetition", signPetition)
 	router.GET("/signatories", getSignatories)
-	router.Run("localhost:3032")
-	log.Println("Server is running on :3032")
 
+	log.Println("Server is running on :3032")
+	if err := router.Run("localhost:3032"); err != nil {
+		log.Fatal(err)
+	}
 }

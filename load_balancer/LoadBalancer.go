@@ -199,13 +199,13 @@ func (lb *LoadBalancer) handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (lb *LoadBalancer) start(dl DistributedLock,ctx context.Context){
-
+	print("stat function called")
 	for {
 		// Acquire the lock
-		err := dl.Lock(ctx, 20) // Set TTL to 10 seconds
-		if err != nil {
-			continue
-		}
+		// err := dl.Lock(ctx, 20) // Set TTL to 10 seconds
+		// if err != nil {
+		// 	continue
+		// }
 
 		activeServerLocation := dl.Value
 		isActive, _ := lb.checkHealth(activeServerLocation)
@@ -238,6 +238,7 @@ func (lb *LoadBalancer) startListening(address string){
 
 func main() {
 
+	print("Starting Load Balancer...\n")
 	lb := &LoadBalancer{
 		servers: []Server{
 			Server{
@@ -288,10 +289,10 @@ func main() {
 	}
 
 	defer client.Close()
-
+	port := os.Getenv("PORT")
 	ctx := context.Background()
 	lockKey := "active-sever-address"
-	lockValue := ":8080" 
+	lockValue := port
 
 	dl := DistributedLock{
 		Key:        lockKey,
@@ -299,6 +300,7 @@ func main() {
 		etcdClient: client,
 	}	
 	
+	print("Load Balancer started at :",port)
 	lb.start(dl,ctx)
 
 }

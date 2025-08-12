@@ -2,10 +2,10 @@ go 1.21.4
 
 use (
 	./backend/server_1
-	./backend/server_2
+	// ./backend/server_2
 	./load_balancer
 	./auth/server_1
-	./auth/server_2
+	// ./auth/server_2
 	./backend/petition1
-	./backend/petition2
+	// ./backend/petition2
 )
