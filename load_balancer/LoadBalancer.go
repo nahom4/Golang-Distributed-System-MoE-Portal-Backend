@@ -232,77 +232,40 @@ func (lb *LoadBalancer) checkHealth(address string)(bool,error){
 	conn.Close()
 	return true,err
 }
-func (lb *LoadBalancer) startListening(address string){
-	http.ListenAndServe(address, nil)
+func (lb *LoadBalancer) startListening(port string) {
+    if !strings.HasPrefix(port, ":") {
+        port = ":" + port
+    }
+    log.Printf("Listening on %s", port)
+    if err := http.ListenAndServe(port, nil); err != nil {
+        log.Fatalf("Server stopped: %v", err)
+    }
 }
-
 func main() {
+    log.Println("Starting Load Balancer...")
 
-	print("Starting Load Balancer...\n")
-	lb := &LoadBalancer{
-		servers: []Server{
-			Server{
-				Address:   parseURL("http://localhost:3030"),
-				Latitude:  10.5,
-				Longitude: 20.6,
-			},
-			Server{
-				Address:   parseURL("http://localhost:3031"),
-				Latitude:  70.5,
-				Longitude: 46.5,
-			},
-		},
-		petitionServers : []Server{
-			Server{
-				Address:   parseURL("http://localhost:3032"),
-				Latitude:  10.5,
-				Longitude: 20.6,
-			},
-			Server{
-				Address:   parseURL("http://localhost:3033"),
-				Latitude:  70.5,
-				Longitude: 46.5,
-			},
-		},
-		documentWebSockets: make(map[string]*url.URL),
-	
-	}
+    lb := &LoadBalancer{
+        servers: []Server{
+            {Address: parseURL("http://localhost:3030"), Latitude: 10.5, Longitude: 20.6},
+            {Address: parseURL("http://localhost:3031"), Latitude: 70.5, Longitude: 46.5},
+        },
+        petitionServers: []Server{
+            {Address: parseURL("http://localhost:3032"), Latitude: 10.5, Longitude: 20.6},
+            {Address: parseURL("http://localhost:3033"), Latitude: 70.5, Longitude: 46.5},
+        },
+        documentWebSockets: make(map[string]*url.URL),
+    }
 
-	corsMiddleware := cors.Default()
-	handler := corsMiddleware.Handler(http.HandlerFunc(lb.handleRequest))
+    corsMiddleware := cors.Default()
+    handler := corsMiddleware.Handler(http.HandlerFunc(lb.handleRequest))
+    http.Handle("/", handler)
 
-	
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
 
-	// http.HandleFunc("/", lb.handleRequest)
-	http.Handle("/", handler)
-
-	endpoints := []string{"localhost:2379"}
-
-	cfg := clientv3.Config{
-		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second,
-	}
-
-	client, err := clientv3.New(cfg)
-	if err != nil {
-		os.Exit(1)
-	}
-
-	defer client.Close()
-	port := os.Getenv("PORT")
-	ctx := context.Background()
-	lockKey := "active-sever-address"
-	lockValue := port
-
-	dl := DistributedLock{
-		Key:        lockKey,
-		Value:      lockValue,
-		etcdClient: client,
-	}	
-	
-	print("Load Balancer started at :",port)
-	lb.start(dl,ctx)
-
+    lb.startListening(port)
 }
 
 func parseURL(rawURL string) *url.URL {
