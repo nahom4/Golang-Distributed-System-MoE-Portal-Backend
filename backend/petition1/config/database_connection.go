@@ -42,22 +42,22 @@ type SignPetition struct {
 func ConnectDB() {
 	// Use a named shared in-memory DB and hold a single open connection.
 	// This prevents losing the DB when pooling opens/closes new conns.
-	dsn := "file:memdb1?mode=memory&cache=shared"
+	// dsn := "file:memdb1?mode=memory&cache=shared"
 
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("../../shared.db"), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to connect to in-memory DB: ", err)
 	}
 
 	// Limit to a single open conn so the shared in-memory DB persists reliably.
-	sqlDB, err := db.DB()
+	// sqlDB, err := db.DB()
 	if err != nil {
 		log.Fatal("Failed to access underlying sql.DB: ", err)
 	}
-	sqlDB.SetMaxOpenConns(1)
+	// sqlDB.SetMaxOpenConns(1)
 
 	// Run migrations
-	if err := db.AutoMigrate(&Petition{}, &User{}, &SignPetition{}); err != nil {
+	if err := db.AutoMigrate(&Petition{}, &SignPetition{}); err != nil {
 		log.Fatal("Failed to migrate schemas: ", err)
 	}
 

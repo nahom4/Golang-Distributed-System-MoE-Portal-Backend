@@ -149,7 +149,7 @@ func Refresh(tokenStr string)  (LoginResult, error) {
 func getUserPassword(username string) (string, error) {
 	var user models.User
 	database.DB.Where("username = ?", username).First(&user)
-	if user.ID == 0 {
+	if user.UserID == 0 {
 		return "", nil
 	}
 	return user.Password, nil
@@ -158,15 +158,15 @@ func getUserPassword(username string) (string, error) {
 func getUserID(username string) (uint, error) {
     var user models.User
     database.DB.Where("username = ?", username).First(&user)
-    if user.ID == 0 {
+    if user.UserID == 0 {
         return 0, errors.New("User not found")
     }
-    return user.ID, nil
+    return user.UserID, nil
 }
 func getUserRole(username string) (string, error) {
     var user models.User
     database.DB.Where("username = ?", username).First(&user)
-    if user.ID == 0 {
+    if user.UserID == 0 {
         return "", errors.New("User not found")
     }
     return user.Role, nil

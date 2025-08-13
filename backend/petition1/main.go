@@ -191,6 +191,8 @@ func listSignatories(petitionName string) ([]User, error) {
 		Joins("JOIN sign_petitions ON sign_petitions.user_id = users.user_id").
 		Where("sign_petitions.petition_name = ?", petitionName).
 		Scan(&out).Error
+	
+		
 	return out, err
 }
 
@@ -345,7 +347,7 @@ func signPetition(ctx *gin.Context) {
 }
 
 func getSignatories(ctx *gin.Context) {
-	petitionName := ctx.Query("PetitionName")
+	petitionName := ctx.Query("PetitionName") 
 	if petitionName == "" {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "PetitionName is required"})
 		return
